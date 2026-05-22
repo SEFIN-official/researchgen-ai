@@ -1,0 +1,8 @@
+langchain
+langgraph
+chromadb
+sentence-transformers
+pypdf
+openai
+streamlit
+tqdm
