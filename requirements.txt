@@ -1,8 +1,12 @@
 langchain
 langgraph
+langchain-community
+langchain-huggingface
+langchain-google-genai
 chromadb
 sentence-transformers
 pypdf
-openai
+python-dotenv
+pydantic
 streamlit
 tqdm

@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 from graph.workflow import build_graph
 from rag.ingest import ingest_uploaded_files
+from rag.retriever import DEFAULT_K
 
 
 # Initialize graph
@@ -58,7 +59,7 @@ def main():
             st.markdown(content)
 
     # Use chat_input for ChatGPT-like input
-    user_input = st.chat_input("Ask any AI/ML question...")
+    user_input = st.chat_input("Ask any research question...")
 
     if user_input:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -77,7 +78,15 @@ def main():
                 "research": "",
                 "critique": "",
                 "final_answer": "",
-                "complexity": ""
+                "complexity": "",
+                "missing_points": [],
+                "retry_count": 0,
+                "retrieval_k": DEFAULT_K,
+                "requirements": {},
+                "critic_checklist": {},
+                "final_critique": "",
+                "final_critic_checklist": {},
+                "final_retry_count": 0,
             })
             answer = result.get("final_answer", "No response generated.")
         except Exception as e:

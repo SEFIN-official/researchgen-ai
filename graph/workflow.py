@@ -1,11 +1,17 @@
 from langgraph.graph import StateGraph, END
-from typing import TypedDict
+from typing import TypedDict, List, Dict, Any
 
 from agents.researcher import researcher_agent
-from agents.critic import critic_agent
+from agents.critic import critic_agent, final_critic_agent
 from agents.writer import writer_agent
-from rag.retriever import get_retriever
-from utils.llm import get_llm
+from rag.retriever import DEFAULT_K, RETRY_K_INCREMENT
+from rag.multi_retrieve import multi_query_retrieve
+from utils.llm import get_llm, get_judge_llm
+from utils.schemas import ComplexityClassification
+from utils.requirements import detect_requirements
+
+MAX_RETRIES = 2
+MAX_FINAL_RETRIES = 1
 
 
 class GraphState(TypedDict):
@@ -14,44 +20,48 @@ class GraphState(TypedDict):
     research: str
     critique: str
     final_answer: str
-    complexity: str  # NEW
+    complexity: str
+    missing_points: List[str]
+    retry_count: int
+    retrieval_k: int
+    requirements: Dict[str, Any]
+    critic_checklist: Dict[str, Any]
+    final_critique: str
+    final_critic_checklist: Dict[str, Any]
+    final_retry_count: int
 
 
-# 🔍 1. CLASSIFIER NODE
 def classify(state, llm):
+    structured_llm = llm.with_structured_output(ComplexityClassification)
     prompt = f"""
-Classify this question.
+Classify this question for a research assistant.
 
-Return ONLY:
-- SIMPLE (basic definition, short answer)
-- ADVANCED (requires explanation, comparison, deep reasoning)
+SIMPLE: basic definition or short factual answer; no document comparison needed.
+ADVANCED: explanation, comparison, synthesis, or reasoning that benefits from uploaded PDFs.
 
 Question:
 {state["query"]}
 """
-
-    response = llm.invoke(prompt).content.strip().upper()
-
-    if "ADVANCED" in response:
-        state["complexity"] = "ADVANCED"
-    else:
-        state["complexity"] = "SIMPLE"
-
+    result: ComplexityClassification = structured_llm.invoke(prompt)
+    state["complexity"] = result.complexity
     return state
 
 
-# 📚 2. RETRIEVAL
-def retrieve(state):
-    retriever = get_retriever()
-    docs = retriever.invoke(state["query"])
+def set_requirements(state):
+    state["requirements"] = detect_requirements(state["query"])
+    return state
+
+
+def retrieve(state, llm):
+    k = state.get("retrieval_k") or DEFAULT_K
+    docs = multi_query_retrieve(state["query"], k, llm)
     state["documents"] = docs
+    state["retrieval_k"] = k
     return state
 
 
-# 🚀 3. DIRECT WRITER (for SIMPLE queries)
 def simple_writer(state, llm):
     query = state["query"]
-
     prompt = f"""
 Answer the question concisely.
 
@@ -63,53 +73,70 @@ Rules:
 Question:
 {query}
 """
-
     response = llm.invoke(prompt)
     state["final_answer"] = response.content
     return state
 
 
-# 🔁 4. CONDITIONAL FLOW AFTER CLASSIFICATION
 def route_after_classify(state):
     if state["complexity"] == "SIMPLE":
         return "simple_writer"
-    return "retrieve"
+    return "set_requirements"
 
 
-# 🔁 5. CRITIC CHECK
-def check(state):
-    if "INCOMPLETE" in state["critique"]:
-        return "researcher"
+def prepare_retry(state):
+    state["retry_count"] = state.get("retry_count", 0) + 1
+    state["retrieval_k"] = state.get("retrieval_k", DEFAULT_K) + RETRY_K_INCREMENT
+    return state
+
+
+def prepare_final_retry(state):
+    state["final_retry_count"] = state.get("final_retry_count", 0) + 1
+    return state
+
+
+def check_research(state):
+    if state["critique"] in ("INCOMPLETE", "PARTIAL") and state.get("retry_count", 0) < MAX_RETRIES:
+        return "prepare_retry"
     return "writer"
 
 
-# 🧠 BUILD GRAPH
+def check_final(state):
+    if state.get("final_critique") in ("INCOMPLETE", "PARTIAL") and state.get(
+        "final_retry_count", 0
+    ) < MAX_FINAL_RETRIES:
+        return "prepare_final_retry"
+    return END  # noqa: graph terminal
+
+
 def build_graph():
     llm = get_llm()
+    judge_llm = get_judge_llm()
 
     builder = StateGraph(GraphState)
 
-    # Nodes
-    builder.add_node("classify", lambda s: classify(s, llm))
-    builder.add_node("retrieve", retrieve)
+    builder.add_node("classify", lambda s: classify(s, judge_llm))
+    builder.add_node("set_requirements", set_requirements)
+    builder.add_node("retrieve", lambda s: retrieve(s, judge_llm))
     builder.add_node("researcher", lambda s: researcher_agent(s, llm))
-    builder.add_node("critic", lambda s: critic_agent(s, llm))
+    builder.add_node("critic", lambda s: critic_agent(s, judge_llm))
+    builder.add_node("prepare_retry", prepare_retry)
     builder.add_node("writer", lambda s: writer_agent(s, llm))
+    builder.add_node("final_critic", lambda s: final_critic_agent(s, judge_llm))
+    builder.add_node("prepare_final_retry", prepare_final_retry)
     builder.add_node("simple_writer", lambda s: simple_writer(s, llm))
 
-    # Entry point
     builder.set_entry_point("classify")
-
-    # Flow
     builder.add_conditional_edges("classify", route_after_classify)
 
-    # ADVANCED path
+    builder.add_edge("set_requirements", "retrieve")
     builder.add_edge("retrieve", "researcher")
     builder.add_edge("researcher", "critic")
-    builder.add_conditional_edges("critic", check)
-    builder.add_edge("writer", END)
-
-    # SIMPLE path
+    builder.add_conditional_edges("critic", check_research)
+    builder.add_edge("prepare_retry", "retrieve")
+    builder.add_edge("writer", "final_critic")
+    builder.add_conditional_edges("final_critic", check_final)
+    builder.add_edge("prepare_final_retry", "writer")
     builder.add_edge("simple_writer", END)
 
     return builder.compile()
